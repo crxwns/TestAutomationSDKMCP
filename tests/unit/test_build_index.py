@@ -91,7 +91,10 @@ def make_source(root: Path) -> Path:
 
 def artifact_bytes(output: Path) -> dict[str, bytes]:
     paths = artifact_paths(output)
-    return {path.name: path.read_bytes() for path in (paths.faiss, paths.documents, paths.manifest)}
+    return {
+        path.name: path.read_bytes()
+        for path in (paths.faiss, paths.documents, paths.manifest, output / "TA_Docu.sqlite3")
+    }
 
 
 def make_result(output: Path, model: str = "fake") -> BuildResult:
@@ -226,6 +229,7 @@ def test_cli_success_prints_summary_and_progress(
         assert output == tmp_path
         return make_result(output, model="configured-model")
 
+    monkeypatch.setenv("TA_SDK_OLLAMA_URL", "http://127.0.0.1:11434")
     monkeypatch.setattr(build_index_module, "_build_from_arguments", fake_build_from_arguments)
 
     result = build_index_module.main(["--source", "custom-data", "--output", str(tmp_path)])
@@ -245,6 +249,7 @@ def test_cli_failure_is_safe_and_returns_nonzero(
     async def failing_build_from_arguments(source: Path, output: Path) -> BuildResult:
         raise IndexBuildError("configured source is unavailable")
 
+    monkeypatch.setenv("TA_SDK_OLLAMA_URL", "http://127.0.0.1:11434")
     monkeypatch.setattr(build_index_module, "_build_from_arguments", failing_build_from_arguments)
 
     result = build_index_module.main(["--source", "missing", "--output", "out"])
@@ -303,5 +308,5 @@ def test_mid_publication_failure_rolls_back_all_artifacts(monkeypatch: pytest.Mo
     with pytest.raises(IndexBuildError):
         asyncio.run(build_index(source, output, TrackingProvider(), provenance("second")))
 
-    assert replace_count == 8
+    assert replace_count == 9
     assert artifact_bytes(output) == before

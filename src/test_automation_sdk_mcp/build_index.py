@@ -24,7 +24,7 @@ from .chunking import (
     load_source_items,
 )
 from .config import DEFAULT_ARTIFACT_DIRECTORY, RuntimeConfig
-from .documents import ChunkingManifest, DocumentRecord, DocumentStore, IndexManifest
+from .documents import ChunkingManifest, DocumentRecord, DocumentStore, IndexManifest, load_document_store
 from .errors import EmbeddingError, IndexBuildError, TestAutomationSDKError
 from .index import (
     ArtifactPaths,
@@ -32,6 +32,7 @@ from .index import (
     write_document_store,
     write_index_manifest,
 )
+from .lexical import SQLITE_FILENAME, load_lexical_artifacts, write_lexical_index
 from .provider import DEFAULT_BATCH_SIZE, EMBEDDING_DIMENSION, EmbeddingProvenance, EmbeddingProvider
 from .provider.factory import create_embedding_provider
 
@@ -108,8 +109,13 @@ def _publish(staged: ArtifactPaths, destination: ArtifactPaths) -> None:
     """Replace all artifacts with rollback if a publication operation fails."""
 
     backup_directory = Path(tempfile.mkdtemp(prefix=".index-backup-", dir=destination.directory))
-    destinations = (destination.faiss, destination.documents, destination.manifest)
-    staged_files = (staged.faiss, staged.documents, staged.manifest)
+    destinations = (
+        destination.faiss,
+        destination.documents,
+        destination.manifest,
+        destination.directory / SQLITE_FILENAME,
+    )
+    staged_files = (staged.faiss, staged.documents, staged.manifest, staged.directory / SQLITE_FILENAME)
     backups: list[tuple[Path, Path]] = []
     published: list[Path] = []
     try:
@@ -119,8 +125,9 @@ def _publish(staged: ArtifactPaths, destination: ArtifactPaths) -> None:
                 os.replace(destination_path, backup_path)
                 backups.append((destination_path, backup_path))
         for staged_path, destination_path in zip(staged_files, destinations, strict=True):
-            os.replace(staged_path, destination_path)
-            published.append(destination_path)
+            if staged_path.exists():
+                os.replace(staged_path, destination_path)
+                published.append(destination_path)
     except (OSError, RuntimeError) as error:
         for destination_path in published:
             destination_path.unlink(missing_ok=True)
@@ -175,6 +182,8 @@ async def build_index(
         _write_faiss(staged.faiss, index)
         store = _document_store(chunks)
         write_document_store(staged.documents, store)
+        write_lexical_index(staging_directory / SQLITE_FILENAME, staged.documents, store)
+        load_lexical_artifacts(staging_directory)
         manifest = IndexManifest(
             schema_version=2,
             index_type="IndexFlatL2",
@@ -212,6 +221,25 @@ async def build_index(
     )
 
 
+def build_lexical_index(source: Path, output: Path, *, from_documents: bool = False) -> int:
+    """Publish a lexical generation from source exports or existing JSON chunks."""
+    if from_documents:
+        store = load_document_store(source)
+    else:
+        store = _document_store(chunk_items(load_source_items(source)))
+    output.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".index-stage-", dir=output))
+    try:
+        paths = ArtifactPaths(staging)
+        write_document_store(paths.documents, store)
+        write_lexical_index(staging / SQLITE_FILENAME, paths.documents, store)
+        load_lexical_artifacts(staging)
+        _publish(paths, ArtifactPaths(output))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return len(store.documents)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the Test Automation SDK documentation index.")
     parser.add_argument("--source", type=Path, default=Path("data"), help="Raw documentation source directory.")
@@ -219,7 +247,10 @@ def _parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=DEFAULT_ARTIFACT_DIRECTORY,
-        help="Directory for the generated FAISS, documents, and manifest files.",
+        help="Directory for the generated SQLite, documents, and optional vector artifacts.",
+    )
+    parser.add_argument(
+        "--from-documents", type=Path, help="Build SQLite from existing documents JSON without raw sources."
     )
     return parser
 
@@ -245,7 +276,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     print(f"Building documentation index from {args.source}...", file=sys.stderr)
     try:
-        result = asyncio.run(_build_from_arguments(args.source, args.output))
+        config = RuntimeConfig(search_mode="lexical") if args.from_documents else RuntimeConfig.from_environment()
+        if args.from_documents is not None or config.search_mode == "lexical" or not config.embeddings_enabled:
+            count = build_lexical_index(
+                args.from_documents or args.source, args.output, from_documents=args.from_documents is not None
+            )
+            print(f"chunks={count} search=lexical output={args.output}")
+            return 0
+        try:
+            result = asyncio.run(_build_from_arguments(args.source, args.output))
+        except EmbeddingError:
+            print("Embedding build unavailable; publishing a lexical index.", file=sys.stderr)
+            count = build_lexical_index(args.source, args.output)
+            print(f"chunks={count} search=lexical output={args.output}")
+            return 0
     except TestAutomationSDKError as error:
         print(f"error: {error.safe_message}", file=sys.stderr)
         return 1
@@ -261,4 +305,4 @@ def main(arguments: Sequence[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["BuildResult", "build_index", "main"]
+__all__ = ["BuildResult", "build_index", "build_lexical_index", "main"]

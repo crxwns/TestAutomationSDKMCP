@@ -180,14 +180,13 @@ def test_server_exposes_one_strict_annotated_structured_tool(tmp_path: Path) -> 
     for code in ApplicationErrorCode:
         assert code.value in tool.description  # type: ignore[operator]
     for declared_term in (
-        "verified packaged artifacts",
-        "/api/embed",
+        "Verified documentation chunks",
+        "SQLite",
         "connect and request timeouts",
         "cancellation propagates",
         "does not retry",
-        "nearest-first",
         "uncalibrated",
-        "bounded backoff",
+        "cooldown",
     ):
         assert declared_term in tool.description  # type: ignore[operator]
     assert tool.input_schema["required"] == ["query"]  # type: ignore[union-attr]
@@ -218,14 +217,20 @@ def test_server_exposes_one_strict_annotated_structured_tool(tmp_path: Path) -> 
                 "location": "index.html#first",
                 "title": "First",
                 "breadcrumbs": ["Guide"],
-                "distance": 0.0,
+                "chunk_id": "first",
+                "search_method": "vector",
+                "score": 0.0,
+                "score_type": "l2",
             },
             {
                 "content": "Second content",
                 "location": "index.html#second",
                 "title": "Second",
                 "breadcrumbs": ["Reference"],
-                "distance": 9.0,
+                "chunk_id": "second",
+                "search_method": "vector",
+                "score": 9.0,
+                "score_type": "l2",
             },
         ]
     }
@@ -304,18 +309,16 @@ def test_tool_translates_embedding_and_retrieval_failures_safely(tmp_path: Path)
         artifacts=make_artifacts(tmp_path),
         provider=FailingEmbeddingProvider(),
     )
-    with pytest.raises(MCPError, match="Embedding service unavailable") as embedding_error:
-        run(embedding_server.call_tool("retrieve_documentation", {"query": "query"}))
-    assert "private provider response" not in str(embedding_error.value)
+    embedding_result = run(embedding_server.call_tool("retrieve_documentation", {"query": "first"}))
+    assert embedding_result.structured_content["result"][0]["score_type"] == "bm25"  # type: ignore[union-attr]
 
     retrieval_server = create_server(
         RuntimeConfig(model="fake-model", artifact_directory=tmp_path),
         artifacts=make_artifacts(tmp_path, FailingSearchIndex()),
         provider=FakeEmbeddingProvider(),
     )
-    with pytest.raises(MCPError, match="index search failed") as retrieval_error:
-        run(retrieval_server.call_tool("retrieve_documentation", {"query": "query"}))
-    assert "private index failure" not in str(retrieval_error.value)
+    result = run(retrieval_server.call_tool("retrieve_documentation", {"query": "first"}))
+    assert result.structured_content["result"][0]["score_type"] == "bm25"  # type: ignore[union-attr]
 
 
 def provider_validation_error() -> ValidationError:
@@ -450,50 +453,45 @@ def test_client_session_invokes_typed_tool_over_in_memory_transport(tmp_path: Pa
                 "location": "index.html#first",
                 "title": "First",
                 "breadcrumbs": ["Guide"],
-                "distance": 0.0,
+                "chunk_id": "first",
+                "search_method": "vector",
+                "score": 0.0,
+                "score_type": "l2",
             },
             {
                 "content": "Second content",
                 "location": "index.html#second",
                 "title": "Second",
                 "breadcrumbs": ["Reference"],
-                "distance": 9.0,
+                "chunk_id": "second",
+                "search_method": "vector",
+                "score": 9.0,
+                "score_type": "l2",
             },
         ]
     }
     assert provider.closed
 
 
-def test_client_session_raises_safe_protocol_error_for_embedding_failure(tmp_path: Path) -> None:
+def test_client_session_returns_lexical_fallback_for_embedding_failure(tmp_path: Path) -> None:
     server = create_server(
         RuntimeConfig(model="fake-model", artifact_directory=tmp_path),
         artifacts=make_artifacts(tmp_path),
         provider=FailingEmbeddingProvider(),
     )
 
-    async def exercise() -> tuple[dict[str, object] | None, MCPError]:
+    async def exercise() -> None:
         async with (
             InMemoryTransport(server) as (read_stream, write_stream),
             ClientSession(read_stream, write_stream) as session,
         ):
             await session.initialize()
-            tools = await session.list_tools()
-            with pytest.raises(MCPError) as raised:
-                await session.call_tool("retrieve_documentation", {"query": "query"})
-            return tools.tools[0].output_schema, raised.value
+            result = await session.call_tool("retrieve_documentation", {"query": "first"})
+            assert not result.is_error
+            assert result.structured_content is not None
+            assert result.structured_content["result"][0]["score_type"] == "bm25"
 
-    output_schema, error = run(exercise())
-    assert output_schema is not None
-    assert output_schema["properties"]["result"]["items"]["$ref"] == "#/$defs/DocumentationSnippet"  # type: ignore[index]
-    assert error.code == TOOL_EXECUTION_ERROR
-    assert error.message == "Embedding service unavailable."
-    assert error.data == {
-        "schema_version": 1,
-        "code": "embedding_service_unavailable",
-        "classification": "transient",
-        "retryable": True,
-    }
-    assert "private provider response" not in str(error.error)
+    run(exercise())
 
 
 def test_runtime_accepts_differing_model_provenance(tmp_path: Path) -> None:

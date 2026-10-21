@@ -132,3 +132,41 @@ def test_openai_configuration_selects_only_openai_values_and_supports_trust_mode
 def test_invalid_openai_provider_configuration_is_rejected(environment: dict[str, str]) -> None:
     with pytest.raises(ConfigurationError):
         runtime_config_from_environment(environment)
+
+
+def test_search_defaults_to_lexical_without_explicit_endpoint() -> None:
+    config = runtime_config_from_environment({})
+    assert config.search_mode == "auto"
+    assert not config.embeddings_enabled
+
+
+def test_unselected_endpoint_does_not_enable_embeddings() -> None:
+    config = runtime_config_from_environment({"TA_SDK_OPENAI_URL": "http://127.0.0.1:8080/v1/embeddings"})
+    assert not config.embeddings_enabled
+
+
+def test_lexical_ignores_embedding_settings() -> None:
+    config = runtime_config_from_environment(
+        {
+            "TA_SDK_SEARCH_MODE": "LEXICAL",
+            "TA_SDK_EMBEDDING_PROVIDER": "invalid",
+            "TA_SDK_OLLAMA_URL": "invalid",
+            "TA_SDK_OLLAMA_MODEL": "",
+        }
+    )
+    assert config.search_mode == "lexical"
+    assert not config.embeddings_enabled
+    assert config.model is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"TA_SDK_SEARCH_MODE": "unknown"},
+        {"TA_SDK_EMBEDDING_COOLDOWN": "nan"},
+        {"TA_SDK_EMBEDDING_COOLDOWN": "0"},
+    ],
+)
+def test_invalid_search_configuration(values: dict[str, str]) -> None:
+    with pytest.raises(ConfigurationError):
+        runtime_config_from_environment(values)

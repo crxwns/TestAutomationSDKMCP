@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 
 from test_automation_sdk_mcp.build_index import build_index
 from test_automation_sdk_mcp.config import EmbeddingProviderKind
+from test_automation_sdk_mcp.documents import load_document_store
 from test_automation_sdk_mcp.provider import EmbeddingProvenance
 
 
@@ -123,7 +124,10 @@ def test_installed_stdio_entry_point_supports_client_session_without_stdout_nois
                 "location": "index.html",
                 "title": "Intro",
                 "breadcrumbs": [],
-                "distance": 0.0,
+                "chunk_id": load_document_store(output / "TA_Docu.documents.json").documents[0].id,
+                "search_method": "vector",
+                "score": 0.0,
+                "score_type": "l2",
             }
         ]
     }

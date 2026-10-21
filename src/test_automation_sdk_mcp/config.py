@@ -118,12 +118,18 @@ class RuntimeConfig:
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     provider: EmbeddingProviderKind = EmbeddingProviderKind.OLLAMA
+    search_mode: str = "auto"
+    embeddings_enabled: bool = True
+    embedding_cooldown: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.search_mode not in {"auto", "hybrid", "lexical"}:
+            raise ConfigurationError("search_mode must be auto, hybrid, or lexical.")
+        object.__setattr__(self, "embedding_cooldown", _validate_timeout(self.embedding_cooldown, "embedding_cooldown"))
         provider = _parse_provider(self.provider)
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "endpoint_url", _validate_endpoint(self.endpoint_url))
-        if provider is EmbeddingProviderKind.OLLAMA:
+        if provider is EmbeddingProviderKind.OLLAMA and self.search_mode != "lexical":
             if self.model is None:
                 raise ConfigurationError("Ollama embedding model is required.")
             object.__setattr__(self, "model", _validate_model(self.model))
@@ -165,14 +171,23 @@ def runtime_config_from_environment(environ: Mapping[str, str] | None = None) ->
     """Parse `TA_SDK_*` variables without reading the environment at import time."""
 
     values = os.environ if environ is None else environ
-    provider = _parse_provider(values.get("TA_SDK_EMBEDDING_PROVIDER", EmbeddingProviderKind.OLLAMA.value))
+    search_mode = values.get("TA_SDK_SEARCH_MODE", "auto").strip().lower()
+    provider = (
+        _parse_provider(values.get("TA_SDK_EMBEDDING_PROVIDER", EmbeddingProviderKind.OLLAMA.value))
+        if search_mode != "lexical"
+        else EmbeddingProviderKind.OLLAMA
+    )
+    endpoint_variable = "TA_SDK_OLLAMA_URL" if provider is EmbeddingProviderKind.OLLAMA else "TA_SDK_OPENAI_URL"
+    enabled = search_mode != "lexical" and bool(values.get(endpoint_variable))
     result_count = values.get("TA_SDK_RESULT_COUNT")
     connect_timeout = values.get("TA_SDK_CONNECT_TIMEOUT")
     request_timeout = values.get("TA_SDK_REQUEST_TIMEOUT")
     artifact_directory = values.get("TA_SDK_DB_DIR")
     if provider is EmbeddingProviderKind.OLLAMA:
-        endpoint_url = values.get("TA_SDK_OLLAMA_URL", DEFAULT_ENDPOINT_URL)
-        model = values.get("TA_SDK_OLLAMA_MODEL", DEFAULT_MODEL)
+        endpoint_url = (
+            values.get("TA_SDK_OLLAMA_URL", DEFAULT_ENDPOINT_URL) if search_mode != "lexical" else DEFAULT_ENDPOINT_URL
+        )
+        model = values.get("TA_SDK_OLLAMA_MODEL", DEFAULT_MODEL) if search_mode != "lexical" else None
         api_key = values.get("TA_SDK_OLLAMA_API_KEY") or None
     else:
         endpoint_url = values.get("TA_SDK_OPENAI_URL")
@@ -194,6 +209,9 @@ def runtime_config_from_environment(environ: Mapping[str, str] | None = None) ->
             DEFAULT_REQUEST_TIMEOUT if request_timeout is None else _parse_float(request_timeout, "request_timeout")
         ),
         provider=provider,
+        search_mode=search_mode,
+        embeddings_enabled=enabled,
+        embedding_cooldown=_parse_float(values.get("TA_SDK_EMBEDDING_COOLDOWN", "60"), "embedding_cooldown"),
     )
 
 

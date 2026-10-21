@@ -2,12 +2,37 @@
 
 This document describes the implementation of the Test Automation SDK MCP
 server. The server is a read-only, retrieval-augmented documentation service:
-it exposes one MCP tool, `retrieve_documentation`, and uses a selected Ollama
-or OpenAI-compatible embedding endpoint to turn incoming queries into vectors.
-Document vectors are generated ahead of time by the index builder.
+it exposes one MCP tool, `retrieve_documentation`, backed by SQLite FTS5.
+An explicitly configured Ollama or OpenAI-compatible endpoint can optionally
+turn queries into vectors. Document vectors are generated ahead of time.
 
 The index is built ahead of time. Server startup loads and verifies the
 published artifacts; it does not crawl the documentation or rebuild the index.
+
+## Adaptive retrieval
+
+`AdaptiveRetriever` composes SQLite retrieval and the existing vector-only
+`DocumentationRetriever`. The default `auto` mode uses vectors when explicitly
+configured and available; otherwise it searches SQLite. Expected semantic failures
+start a monotonic-clock cooldown (60 seconds by default). Cancellation and unexpected
+programming exceptions propagate. `hybrid` runs both retrieval paths concurrently
+and combines candidate ranks by chunk ID with RRF (`k=60`), without comparing BM25
+and L2 values. `lexical` never constructs or calls an embedding provider.
+
+SQLite indexes the same ordered `DocumentStore` chunks as FAISS. Its metadata stores
+the documents SHA-256 and schema version. Admission checks SQLite integrity, exact
+ordered chunk contents, and FTS integrity without reading vector metadata. Optional
+FAISS loading remains strict but failure leaves verified lexical artifacts available.
+Legacy releases without SQLite can create an in-memory FTS snapshot from hash-verified
+JSON. The runtime never writes index artifacts. Each adaptive retriever holds one
+in-memory SQLite snapshot, reuses it for queries, and closes it on lifespan exit.
+
+The builder can publish SQLite and documents alone, or include FAISS and its manifest
+when an embedding URL is configured. Both paths stage, validate, and publish with
+rollback. Lexical publication removes stale vector artifacts. `--from-documents`
+reuses existing JSON chunks without raw sources or model calls. See the README for
+configuration and output schema migration details. The vector-specific diagrams
+below describe the optional semantic path.
 
 ## System Context
 
@@ -159,7 +184,7 @@ flowchart TD
 	 store[DocumentStore\nrecords in the same order as vectors]
 	 hashes[Hash source search.json\nand HTML tree]
 	 manifest[IndexManifest\nmodel, metric, counts, chunking, hashes]
-	 stage[Temporary staging directory\nwrite three artifacts]
+	 stage[Temporary staging directory\nwrite shared chunks and indexes]
 	 verify[load_verified_artifacts\nvalidate schema, hashes, dimensions,\ncounts, metric, and row mapping]
 	 publish[Atomic publish\nbackup old generation, replace all files,\nrollback on failure]
 	 artifacts[(TA_Docu.faiss\nTA_Docu.documents.json\nTA_Docu.manifest.json)]
@@ -187,14 +212,15 @@ flowchart TD
 	of exactly 768 values per input.
 4. FAISS receives vectors in the same order as the `DocumentStore` records.
 	This order is the row-ID contract used during retrieval.
-5. The builder writes the FAISS index, document JSON, and manifest in a
+5. The builder writes SQLite, FAISS, document JSON, and the vector manifest in a
 	temporary directory, reloads them through the normal verification path, and
 	publishes the complete generation together. A failed publication restores
 	the previous generation.
 
 ## Published Artifact Contract
 
-One index generation consists of three files:
+A lexical generation consists of `TA_Docu.documents.json` and `TA_Docu.sqlite3`.
+A vector generation adds the two vector artifacts. The vector contract is:
 
 ```mermaid
 flowchart LR
@@ -283,7 +309,7 @@ sequenceDiagram
 	 Tool->>Store: map each row ID to ordered DocumentRecord
 	 Store-->>Tool: content, title, location, breadcrumbs
 	 Tool-->>MCP: nearest-first DocumentationSnippet list
-	 MCP-->>Client: structured MCP result with L2 distances
+	 MCP-->>Client: structured MCP result with typed scores
 	 Client-->>Agent: sourced snippets
 	 Agent-->>User: answer grounded in returned locations and content
 ```
@@ -299,8 +325,9 @@ sequenceDiagram
 	at 50 by configuration.
 4. FAISS searches with the L2 metric. Results are sorted nearest-first by
 	distance, and every row ID is checked before it is used as a document index.
-5. The tool returns `content`, `location`, `title`, `breadcrumbs`, and the
-	uncalibrated non-negative L2 `distance` for each snippet. It does not call a
+5. The tool returns `chunk_id`, `content`, `location`, `title`, `breadcrumbs`,
+	`search_method`, `score`, and `score_type` for each snippet. Vector scores are
+	uncalibrated L2; lexical scores are BM25; fused scores are RRF. It does not call a
 	chat model and does not synthesize the final answer.
 
 ## Error and Trust Boundaries
@@ -313,8 +340,8 @@ MCP error with a code, classification, and retryability flag.
 | Boundary            | Examples                                                         | Runtime behavior                                                                 |
 | ------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Query input         | Empty, non-string, or oversized query                            | `invalid_query`; permanent and not retryable.                                    |
-| Provider connection | Timeout or unavailable endpoint                                  | Transient embedding error; retry may be appropriate with bounded backoff.        |
-| Provider response   | Wrong response model, indexes, vector count, dimension, or value | `embedding_response_invalid`; permanent until the service contract is corrected. |
+| Provider connection | Timeout or unavailable endpoint                                  | SQLite fallback and a semantic cooldown.        |
+| Provider response   | Wrong response model, indexes, vector count, dimension, or value | SQLite fallback and a semantic cooldown; correct the provider contract. |
 | FAISS/artifacts     | Invalid index, row ID, distance, hash, count, or schema          | Retrieval or artifact failure; the server does not serve unverified data.        |
 | MCP output          | Invalid snippet fields or distance                               | `tool_output_invalid`; the response is rejected rather than returned partially.  |
 
@@ -328,8 +355,10 @@ traffic remains parseable.
 
 | Variable                    | Default                  | Used by                                                     |
 | --------------------------- | ------------------------ | ----------------------------------------------------------- |
+| `TA_SDK_SEARCH_MODE` | `auto` | `auto`, `hybrid`, or `lexical`. |
+| `TA_SDK_EMBEDDING_COOLDOWN` | `60` seconds | Semantic retry cooldown after an expected failure. |
 | `TA_SDK_EMBEDDING_PROVIDER` | `ollama`                 | Selects `ollama` or `openai`.                               |
-| `TA_SDK_OLLAMA_URL`         | `http://127.0.0.1:11434` | Ollama base URL; `/api/embed` is appended.                  |
+| `TA_SDK_OLLAMA_URL`         | unset | Ollama base URL; `/api/embed` is appended.                  |
 | `TA_SDK_OLLAMA_MODEL`       | `nomic-embed-text:v1.5`  | Required request model; manifest value is build provenance. |
 | `TA_SDK_OLLAMA_API_KEY`     | unset                    | Optional Ollama bearer token.                               |
 | `TA_SDK_OPENAI_URL`         | unset                    | Complete `/v1/embeddings` endpoint.                         |

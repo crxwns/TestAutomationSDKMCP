@@ -1,13 +1,15 @@
 """Read-only documentation retrieval and MCP server boundary."""
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib.metadata import version
 from math import isfinite
 from pathlib import Path
-from typing import Annotated, cast
+from time import monotonic
+from typing import Annotated, Literal, cast
 
 import numpy as np
 from mcp.server import MCPServer
@@ -18,8 +20,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .config import DEFAULT_ARTIFACT_DIRECTORY, RuntimeConfig
 from .documents import EMBEDDING_DIMENSION
-from .errors import ApplicationErrorCode, ConfigurationError, RetrievalError, TestAutomationSDKError, to_mcp_error
-from .index import LoadedArtifacts, load_packaged_artifacts, load_verified_artifacts
+from .errors import (
+    ApplicationErrorCode,
+    ConfigurationError,
+    EmbeddingError,
+    RetrievalError,
+    TestAutomationSDKError,
+    to_mcp_error,
+)
+from .index import LoadedArtifacts, load_verified_artifacts
+from .lexical import LexicalArtifacts, LexicalSearch, load_runtime_artifacts
 from .provider import EmbeddingProvider
 from .provider.factory import create_embedding_provider
 
@@ -40,19 +50,15 @@ TOOL_DESCRIPTION = (
     "development. Use for exact APIs and patterns involving TestEnvironmentAccess or the ta fixture, variables, "
     "ports, Capturing or MultiPortCapturing, rasters and triggers, Scenario parameterization and lifecycle, "
     "synchronization, or capture result analysis. Do not use for generic Python or pytest questions or unrelated "
-    "dSPACE products. Preconditions: verified packaged artifacts are loaded and the configured embedding endpoint "
-    "is reachable (/api/embed or /v1/embeddings). The manifest provider and model describe build provenance; "
-    "runtime embedding-space compatibility is the operator's responsibility. "
-    "Embedding HTTP calls use configured connect and request timeouts (defaults: 5 and 30 seconds; maximum: 300 "
-    "seconds), and MCP cancellation propagates to an in-flight asynchronous request. The server does not retry "
-    "embedding requests internally. "
-    "Success returns "
-    "nearest-first documentation snippets with source locations and uncalibrated FAISS L2 distances. Public failures "
-    "are invalid_query (permanent), embedding_request_timed_out (transient), embedding_service_unavailable "
-    "(transient), embedding_service_rejected_request (permanent), embedding_service_failure (transient), "
-    "embedding_response_invalid (permanent), retrieval_failed (permanent), tool_output_invalid (permanent), and "
-    "server_runtime_unavailable (transient). Retry only transient failures with bounded backoff; change the input or "
-    "configuration for permanent failures."
+    "dSPACE products. Verified documentation chunks are required. Search modes: auto uses embeddings when "
+    "configured, with SQLite fallback; lexical uses SQLite only; hybrid fuses SQLite and vector ranks via RRF. "
+    "No embedding endpoint is needed for lexical retrieval. Vector scores are uncalibrated L2 distances, "
+    "lexical scores are SQLite BM25 (lower is better), and RRF scores are higher-is-better. "
+    "Embedding calls use configured connect and request timeouts; cancellation propagates and the server "
+    "does not retry internally. Failed embedding calls trigger a cooldown and lexical fallback. "
+    "Errors: invalid_query, embedding_request_timed_out, embedding_service_unavailable, "
+    "embedding_service_rejected_request, embedding_service_failure, embedding_response_invalid, "
+    "retrieval_failed, tool_output_invalid, server_runtime_unavailable."
 )
 
 
@@ -65,7 +71,10 @@ class DocumentationSnippet(BaseModel):
     location: str
     title: str
     breadcrumbs: list[str]
-    distance: float = Field(description="L2 distance returned by the FAISS index.")
+    chunk_id: str
+    search_method: Literal["vector", "lexical", "hybrid"]
+    score: float
+    score_type: Literal["l2", "bm25", "rrf"]
 
     @field_validator("content", "location", "title")
     @classmethod
@@ -74,11 +83,11 @@ class DocumentationSnippet(BaseModel):
             raise ValueError("snippet text fields must not be empty")
         return value
 
-    @field_validator("distance")
+    @field_validator("score")
     @classmethod
     def validate_distance(cls, value: float) -> float:
-        if not isfinite(value) or value < 0:
-            raise ValueError("distance must be a finite non-negative L2 distance")
+        if not isfinite(value):
+            raise ValueError("score must be finite")
         return value
 
 
@@ -91,11 +100,14 @@ class RetrievalResult:
     title: str
     breadcrumbs: tuple[str, ...]
     distance: float
+    chunk_id: str = ""
+    search_method: Literal["vector", "lexical", "hybrid"] = "vector"
+    score_type: Literal["l2", "bm25", "rrf"] = "l2"
 
 
 @dataclass(frozen=True, slots=True)
 class _ServerRuntime:
-    retriever: "DocumentationRetriever"
+    retriever: "AdaptiveRetriever"
 
 
 EmbeddingProviderFactory = Callable[[RuntimeConfig], EmbeddingProvider]
@@ -251,9 +263,75 @@ class DocumentationRetriever:
                     title=document.title,
                     breadcrumbs=document.breadcrumbs,
                     distance=float(distances[0][position]),
+                    chunk_id=document.id,
                 )
             )
         return results
+
+
+class AdaptiveRetriever(DocumentationRetriever):
+    """Use SQLite independently and isolate expected failures of optional semantics."""
+
+    def __init__(
+        self,
+        artifacts: LoadedArtifacts | LexicalArtifacts,
+        provider: EmbeddingProvider | None,
+        config: RuntimeConfig,
+    ) -> None:
+        self._store = artifacts.documents
+        self._lexical_search = LexicalSearch(self._store)
+        self._config = config
+        self._vector = (
+            DocumentationRetriever(artifacts, provider, min(50, config.result_count * 4))
+            if isinstance(artifacts, LoadedArtifacts) and provider is not None and config.search_mode != "lexical"
+            else None
+        )
+        self._unavailable_until = 0.0
+
+    def close(self) -> None:
+        self._lexical_search.close()
+
+    async def _lexical(self, query: str) -> list[RetrievalResult]:
+        rows = await asyncio.to_thread(self._lexical_search.search, query, min(50, self._config.result_count * 4))
+        documents = {doc.id: doc for doc in self._store.documents}
+        return [
+            RetrievalResult(doc.content, doc.location, doc.title, doc.breadcrumbs, score, chunk_id, "lexical", "bm25")
+            for chunk_id, score in rows
+            for doc in [documents[chunk_id]]
+        ]
+
+    async def _semantic(self, query: str) -> list[RetrievalResult] | None:
+        if self._vector is None or monotonic() < self._unavailable_until:
+            return None
+        try:
+            return await self._vector.retrieve(query)
+        except (RetrievalError, EmbeddingError):
+            logging.getLogger(__name__).warning(
+                "Semantic search unavailable; using SQLite during the embedding cooldown."
+            )
+            self._unavailable_until = monotonic() + self._config.embedding_cooldown
+            return None
+
+    async def retrieve(self, query: str) -> list[RetrievalResult]:
+        query = _validate_query(query)
+        count = self._config.result_count
+        if self._config.search_mode == "hybrid":
+            lexical, semantic = await asyncio.gather(self._lexical(query), self._semantic(query))
+            if semantic is None:
+                return lexical[:count]
+            scores: dict[str, float] = {}
+            snippets: dict[str, RetrievalResult] = {}
+            for ranking in (lexical, semantic):
+                for rank, result in enumerate(ranking, 1):
+                    scores[result.chunk_id] = scores.get(result.chunk_id, 0.0) + 1.0 / (60 + rank)
+                    snippets[result.chunk_id] = result
+            return [
+                RetrievalResult(r.content, r.location, r.title, r.breadcrumbs, scores[key], key, "hybrid", "rrf")
+                for key in sorted(scores, key=lambda key: (-scores[key], key))[:count]
+                for r in [snippets[key]]
+            ]
+        semantic = await self._semantic(query)
+        return semantic[:count] if semantic is not None else (await self._lexical(query))[:count]
 
 
 def _default_provider_factory(config: RuntimeConfig) -> EmbeddingProvider:
@@ -270,7 +348,10 @@ def _snippet(result: RetrievalResult) -> DocumentationSnippet:
         location=result.location,
         title=result.title,
         breadcrumbs=list(result.breadcrumbs),
-        distance=result.distance,
+        chunk_id=result.chunk_id,
+        search_method=result.search_method,
+        score=result.distance,
+        score_type=result.score_type,
     )
 
 
@@ -289,17 +370,23 @@ def create_server(
     if artifacts is not None:
         loaded_artifacts = artifacts
     elif runtime_config.artifact_directory == DEFAULT_ARTIFACT_DIRECTORY:
-        loaded_artifacts = load_packaged_artifacts()
+        loaded_artifacts = load_runtime_artifacts(
+            DEFAULT_ARTIFACT_DIRECTORY,
+            vectors=runtime_config.embeddings_enabled and runtime_config.search_mode != "lexical",
+        )
     else:
-        loaded_artifacts = load_verified_artifacts(runtime_config.artifact_directory)
+        loaded_artifacts = load_runtime_artifacts(
+            runtime_config.artifact_directory,
+            vectors=runtime_config.embeddings_enabled and runtime_config.search_mode != "lexical",
+        )
     factory = _default_provider_factory if provider_factory is None else provider_factory
     direct_retriever = (
         None
         if provider is None
-        else DocumentationRetriever(
+        else AdaptiveRetriever(
             loaded_artifacts,
             provider,
-            runtime_config.result_count,
+            runtime_config,
         )
     )
     active_runtime: _ServerRuntime | None = None
@@ -307,19 +394,29 @@ def create_server(
     @asynccontextmanager
     async def lifespan(_: MCPServer[_ServerRuntime]) -> AsyncGenerator[_ServerRuntime, None]:
         nonlocal active_runtime
-        owned_provider = provider if provider is not None else factory(runtime_config)
+        owned_provider = provider
+        if (
+            owned_provider is None
+            and isinstance(loaded_artifacts, LoadedArtifacts)
+            and runtime_config.embeddings_enabled
+            and runtime_config.search_mode != "lexical"
+        ):
+            owned_provider = factory(runtime_config)
         active_runtime = _ServerRuntime(
-            retriever=DocumentationRetriever(
+            retriever=direct_retriever
+            or AdaptiveRetriever(
                 loaded_artifacts,
                 owned_provider,
-                runtime_config.result_count,
+                runtime_config,
             )
         )
         try:
             yield active_runtime
         finally:
+            active_runtime.retriever.close()
             active_runtime = None
-            await _close_provider(owned_provider)
+            if owned_provider is not None:
+                await _close_provider(owned_provider)
 
     server = MCPServer[_ServerRuntime](
         name="Test Automation SDK",
